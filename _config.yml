@@ -1,0 +1,9 @@
+# _config.yml
+theme: minima
+
+# Include your custom CSS file
+sass:
+  style: compressed
+
+include:
+  - assets/css/custom.css

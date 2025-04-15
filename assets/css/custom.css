@@ -31,6 +31,17 @@
   }
 
 
+  body {
+    font-family: "Georgia", "Libre Baskerville", serif;
+  }
+
+  h1, h2, h3, em, blockquote {
+    font-family: "Georgia", "Playfair Display", serif;
+    font-style: italic;
+  }
+
+
+
   @media (max-width: 768px) {
     .sidenote {
       float: none;

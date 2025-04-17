@@ -9,7 +9,7 @@ from transformers import (
 )
 from transformers.utils import is_peft_available
 
-from trl import PPOConfig, PPOTrainer
+from trl_shim import PPOConfig, PPOTrainer
 from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 from peft import LoraModel, LoraConfig
 

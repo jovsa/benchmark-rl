@@ -1,4 +1,10 @@
+gymnasium
 black
 nvitop
 peft
 trl
+tyro
+tensorboard
+stable-baselines3
+ale-py
+pufferlib

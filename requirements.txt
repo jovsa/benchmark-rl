@@ -1,4 +1,5 @@
 gymnasium
+bitsandbytes
 black
 nvitop
 peft

@@ -57,6 +57,10 @@ class ScriptArguments:
         default=32,
         metadata={"help": "max number of ppo epochs"},
     )
+    train_dataset_size: Optional[int] = field(
+        default=100,
+        metadata={"help": "number of training samples to use"},
+    )
 
 
 def parse_args(args=None):
@@ -106,7 +110,7 @@ def setup(script_args):
     ds = load_dataset("openai/gsm8k", "main", split="train")
     ds = ds.rename_columns({"question": "query"})
     ds = ds.map(lambda x: {"answer": x["answer"].split("#### ")[1]})
-    ds = ds.select(range(1, len(ds)))  # skip first sample used in prompt
+    ds = ds.select(range(1, script_args.train_dataset_size + 1))  # use specified number of samples
 
     ds_test = load_dataset("openai/gsm8k", "main", split="test")
     ds_test = ds_test.rename_columns({"question": "query"})
@@ -135,6 +139,10 @@ def setup(script_args):
     ds = ds.map(tokenize, remove_columns=ds.column_names)
     ds_test = ds_test.map(tokenize, remove_columns=ds_test.column_names)
 
+    # Set format for PyTorch
+    ds.set_format(type="torch", columns=["input_ids", "attention_mask", "answer"])
+    ds_test.set_format(type="torch", columns=["input_ids", "attention_mask", "answer"])
+
     return (
         model,
         ref_model,
@@ -144,6 +152,72 @@ def setup(script_args):
         ds,
         ds_test,
     )
+
+
+def evaluate_model(model, tokenizer, dataset, batch_size=8):
+    """Evaluate model on a dataset and return metrics."""
+    model.eval()
+    device = model.device
+    total_reward = 0
+    correct_predictions = 0
+    total_samples = 0
+
+    # Convert dataset to list for easier batching
+    dataset_list = list(dataset)
+
+    for i in range(0, len(dataset_list), batch_size):
+        batch = dataset_list[i:i + batch_size]
+
+        # Generate responses using input_ids
+        responses = []
+        answers = []
+        for item in batch:
+            # Decode input_ids to get the original query
+            query = tokenizer.decode(item["input_ids"], skip_special_tokens=True)
+            answers.append(item["answer"])
+
+            # Generate response
+            inputs = {
+                "input_ids": item["input_ids"].unsqueeze(0).to(device),
+                "attention_mask": item["attention_mask"].unsqueeze(0).to(device)
+            }
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=256,
+                pad_token_id=tokenizer.pad_token_id,
+                do_sample=True,
+                top_p=0.9,
+                temperature=0.7,
+            )
+            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            responses.append(response)
+
+        # Compute rewards
+        rewards = compute_rewards(responses, answers)
+        total_reward += sum(rewards)
+
+        # Count correct predictions
+        for response, answer in zip(responses, answers):
+            try:
+                predicted_number = None
+                match_pattern = re.findall(r"Result\s*=\s*(-?\d+(?:\.\d+)?)\s*<submit>", response)
+                if match_pattern:
+                    predicted_number = float(match_pattern[0])
+                if predicted_number is not None and abs(predicted_number - float(answer)) < 0.1:
+                    correct_predictions += 1
+            except Exception:
+                pass
+
+        total_samples += len(batch)
+
+    accuracy = correct_predictions / total_samples if total_samples > 0 else 0
+    mean_reward = total_reward / total_samples if total_samples > 0 else 0
+
+    return {
+        "accuracy": accuracy,
+        "mean_reward": mean_reward,
+        "total_samples": total_samples
+    }
 
 
 def main(script_args=None):
@@ -194,11 +268,30 @@ def main(script_args=None):
         peft_config=lora_config,
     )
 
+    # dataset statistics
+    print(f"Training dataset size: {len(ds)}")
+    print(f"Test dataset size: {len(ds_test)}")
+
+    # Evaluate before training
+    print("\nPre-training evaluation:")
+    train_metrics = evaluate_model(model, tokenizer, ds)
+    test_metrics = evaluate_model(model, tokenizer, ds_test)
+    print(f"Training set - Accuracy: {train_metrics['accuracy']:.4f}, Mean Reward: {train_metrics['mean_reward']:.4f}")
+    print(f"Test set - Accuracy: {test_metrics['accuracy']:.4f}, Mean Reward: {test_metrics['mean_reward']:.4f}")
+
     # Train the model
     ppo_trainer.train()
 
+    # Evaluate after training
+    print("\nPost-training evaluation:")
+    train_metrics = evaluate_model(model, tokenizer, ds)
+    test_metrics = evaluate_model(model, tokenizer, ds_test)
+    print(f"Training set - Accuracy: {train_metrics['accuracy']:.4f}, Mean Reward: {train_metrics['mean_reward']:.4f}")
+    print(f"Test set - Accuracy: {test_metrics['accuracy']:.4f}, Mean Reward: {test_metrics['mean_reward']:.4f}")
+
     # Save the model
-    ppo_trainer.save_pretrained(f"model/{script_args.model_name}-gsm8k")
+    model.save_pretrained(f"model/{script_args.model_name}-gsm8k")
+    tokenizer.save_pretrained(f"model/{script_args.model_name}-gsm8k")
 
 
 def compute_rewards(responses, answers):
@@ -218,23 +311,6 @@ def compute_rewards(responses, answers):
             pass
         rewards.append(torch.tensor(reward))
     return rewards
-
-
-def evaluate(dataset, ppo_trainer):
-    """Evaluate model on dataset."""
-    rewards = []
-    for batch in ppo_trainer.get_eval_dataloader():
-        responses = ppo_trainer.generate(batch["query"])
-        batch_rewards = compute_rewards(responses, batch["answer"])
-        rewards.extend(batch_rewards)
-
-    if not rewards:
-        return torch.tensor(0.0)
-
-    rewards = ppo_trainer.accelerator.gather_for_metrics(
-        torch.stack(rewards).to(ppo_trainer.accelerator.device)
-    )
-    return rewards.mean()
 
 
 if __name__ == "__main__":

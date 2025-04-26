@@ -12,6 +12,7 @@ from python_interpreter_ppo import (
     setup,
     main,
 )
+from .trl_shim import PPOConfig, PPOTrainer
 
 
 class TestPythonInterpreterPPO(unittest.TestCase):

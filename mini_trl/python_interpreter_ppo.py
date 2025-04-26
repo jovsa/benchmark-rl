@@ -15,7 +15,7 @@ from transformers import (
     HfArgumentParser,
 )
 
-from trl_shim import PPOConfig, PPOTrainer
+from .trl_shim import PPOConfig, PPOTrainer
 from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 
 

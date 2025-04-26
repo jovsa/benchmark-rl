@@ -1,0 +1,3 @@
+[submodule "mini_trl/trl"]
+	path = mini_trl/trl
+	url = https://github.com/jovsa/trl.git

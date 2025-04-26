@@ -13,7 +13,6 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     HfArgumentParser,
-    load_tool,
 )
 
 from trl import PPOConfig, PPOTrainer, TextEnvironment
@@ -26,7 +25,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 @dataclass
 class ScriptArguments:
     model_name: Optional[str] = field(
-        default="bigcode/starcoderbase",
+        default="gpt2",
         metadata={"help": "the model name"},
     )
     learning_rate: Optional[float] = field(
@@ -110,19 +109,29 @@ def setup(script_args):
     # Load base model
     model = AutoModelForCausalLM.from_pretrained(
         script_args.model_name,
-        use_auth_token=True,
-        load_in_4bit=True,
+        token=True,
     )
+    # Wrap model in a way that TextEnvironment expects
+    class WrappedModel(torch.nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.pretrained_model = model
+            self.device = model.device
+
+        def __call__(self, *args, **kwargs):
+            return self.pretrained_model(*args, **kwargs)
+
+    wrapped_model = WrappedModel(model)
     ref_model = AutoModelForCausalLM.from_pretrained(
         script_args.model_name,
-        use_auth_token=True,
-        load_in_4bit=True,
+        token=True,
     )
+    wrapped_ref_model = WrappedModel(ref_model)
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         script_args.model_name,
-        use_auth_token=True,
+        token=True,
     )
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -130,12 +139,12 @@ def setup(script_args):
     reward_model = AutoModelForSequenceClassification.from_pretrained(
         script_args.model_name,
         num_labels=1,
-        use_auth_token=True,
+        token=True,
     )
     value_model = AutoModelForSequenceClassification.from_pretrained(
         script_args.model_name,
         num_labels=1,
-        use_auth_token=True,
+        token=True,
     )
 
     # Load and prepare dataset
@@ -148,19 +157,25 @@ def setup(script_args):
     ds_test = ds_test.rename_columns({"question": "query"})
     ds_test = ds_test.map(lambda x: {"answer": x["answer"].split("#### ")[1]})
 
-    test_dataloader = torch.utils.data.DataLoader(
-        ds_test,
-        batch_size=script_args.batch_size,
-    )
+    # Tokenize datasets
+    def tokenize(example):
+        tokenized = tokenizer(text=example["query"])
+        if tokenizer.eos_token_id is not None and tokenized["input_ids"][-1] != tokenizer.eos_token_id:
+            tokenized["input_ids"] = tokenized["input_ids"] + [tokenizer.eos_token_id]
+            tokenized["attention_mask"] = tokenized["attention_mask"] + [1]
+        return tokenized
+
+    ds = ds.map(tokenize, remove_columns="query")
+    ds_test = ds_test.map(tokenize, remove_columns="query")
 
     return (
-        model,
-        ref_model,
+        wrapped_model,
+        wrapped_ref_model,
         tokenizer,
         value_model,
         reward_model,
         ds,
-        test_dataloader,
+        ds_test,
     )
 
 
@@ -177,7 +192,7 @@ def main(script_args=None):
         value_model,
         reward_model,
         ds,
-        test_dataloader,
+        ds_test,
     ) = setup(script_args)
 
     # Configure PEFT
@@ -202,17 +217,18 @@ def main(script_args=None):
     # Create trainer
     ppo_trainer = PPOTrainer(
         args=ppo_config,
+        processing_class=tokenizer,
         model=model,
         ref_model=ref_model,
-        tokenizer=tokenizer,
         reward_model=reward_model,
         value_model=value_model,
         train_dataset=ds,
+        eval_dataset=ds_test,
         peft_config=lora_config,
     )
 
     # Prepare test dataloader
-    test_dataloader = ppo_trainer.accelerator.prepare(test_dataloader)
+    test_dataloader = ppo_trainer.accelerator.prepare(ds_test)
 
     # Setup text environment
     prompt = """\
@@ -247,11 +263,11 @@ Q: """
     }
 
     text_env = TextEnvironment(
-        model,
-        tokenizer,
-        [load_tool("lvwerra/python-interpreter")],
-        exact_match_reward,
-        prompt,
+        model=model,
+        tokenizer=tokenizer,
+        tools=[],  # No external tools needed
+        reward_fn=exact_match_reward,
+        prompt=prompt,
         max_turns=2,
         generation_kwargs=generation_kwargs,
     )

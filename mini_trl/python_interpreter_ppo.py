@@ -15,7 +15,8 @@ from transformers import (
     HfArgumentParser,
 )
 
-from trl import PPOConfig, PPOTrainer, TextEnvironment
+from trl_shim import PPOConfig, PPOTrainer
+from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 
 
 os.environ["HF_ALLOW_CODE_EVAL"] = "1"
@@ -37,7 +38,7 @@ class ScriptArguments:
         metadata={"help": "the PPO minibatch size"},
     )
     batch_size: Optional[int] = field(
-        default=32,
+        default=16,
         metadata={"help": "the batch size"},
     )
     gradient_accumulation_steps: Optional[int] = field(
@@ -67,73 +68,27 @@ def parse_args(args=None):
     return script_args
 
 
-def exact_match_reward(responses, answers=None):
-    """Reward if generated response contains correct answer."""
-    rewards = []
-    pattern = r"Result\s*=\s*(-?\d+(?:\.\d+)?)\s*<submit>"
-    for response, answer in zip(responses, answers):
-        reward = 0.0
-        try:
-            predicted_number = None
-            match_pattern = re.findall(pattern, response)
-            if match_pattern:
-                predicted_number = float(match_pattern[0])
-            if predicted_number is not None:
-                if np.abs(predicted_number - float(answer)) < 0.1:
-                    reward += 1.0
-        except Exception:
-            pass
-        rewards.append(torch.tensor(reward))
-    return rewards
-
-
-def evaluate(test_dataloader, text_env, ppo_trainer):
-    test_rewards = []
-    for test_batch in test_dataloader:
-        _, _, _, rewards, _ = text_env.run(
-            test_batch["query"],
-            answers=test_batch["answer"],
-        )
-        test_rewards.extend(rewards)
-
-    if not test_rewards:
-        return torch.tensor(0.0)
-
-    test_rewards = ppo_trainer.accelerator.gather_for_metrics(
-        torch.stack(test_rewards).to(ppo_trainer.accelerator.device)
-    )
-    return test_rewards.mean()
-
-
 def setup(script_args):
     # Load base model
     model = AutoModelForCausalLM.from_pretrained(
         script_args.model_name,
         token=True,
     )
-    # Wrap model in a way that TextEnvironment expects
-    class WrappedModel(torch.nn.Module):
-        def __init__(self, model):
-            super().__init__()
-            self.pretrained_model = model
-            self.device = model.device
-
-        def __call__(self, *args, **kwargs):
-            return self.pretrained_model(*args, **kwargs)
-
-    wrapped_model = WrappedModel(model)
     ref_model = AutoModelForCausalLM.from_pretrained(
         script_args.model_name,
         token=True,
     )
-    wrapped_ref_model = WrappedModel(ref_model)
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         script_args.model_name,
         token=True,
+        padding_side="left",
     )
     tokenizer.pad_token = tokenizer.eos_token
+
+    if tokenizer.chat_template is None:
+        tokenizer.chat_template = SIMPLE_CHAT_TEMPLATE
 
     # Load reward and value models
     reward_model = AutoModelForSequenceClassification.from_pretrained(
@@ -159,18 +114,30 @@ def setup(script_args):
 
     # Tokenize datasets
     def tokenize(example):
-        tokenized = tokenizer(text=example["query"])
-        if tokenizer.eos_token_id is not None and tokenized["input_ids"][-1] != tokenizer.eos_token_id:
-            tokenized["input_ids"] = tokenized["input_ids"] + [tokenizer.eos_token_id]
-            tokenized["attention_mask"] = tokenized["attention_mask"] + [1]
-        return tokenized
+        # Tokenize input
+        input_ids = tokenizer(
+            text=example["query"],
+            truncation=True,
+            padding="max_length",
+            max_length=512,
+            return_tensors=None,
+        )
 
-    ds = ds.map(tokenize, remove_columns="query")
-    ds_test = ds_test.map(tokenize, remove_columns="query")
+        # Convert answer to float, removing commas
+        answer = float(example["answer"].replace(",", ""))
+
+        return {
+            "input_ids": input_ids["input_ids"],
+            "attention_mask": input_ids["attention_mask"],
+            "answer": answer,
+        }
+
+    ds = ds.map(tokenize, remove_columns=ds.column_names)
+    ds_test = ds_test.map(tokenize, remove_columns=ds_test.column_names)
 
     return (
-        wrapped_model,
-        wrapped_ref_model,
+        model,
+        ref_model,
         tokenizer,
         value_model,
         reward_model,
@@ -210,7 +177,7 @@ def main(script_args=None):
         output_dir="model",
         per_device_train_batch_size=script_args.batch_size,
         per_device_eval_batch_size=script_args.batch_size // 2,
-        num_train_epochs=script_args.ppo_epochs,
+        num_ppo_epochs=script_args.ppo_epochs,
         report_to="none",
     )
 
@@ -227,89 +194,47 @@ def main(script_args=None):
         peft_config=lora_config,
     )
 
-    # Prepare test dataloader
-    test_dataloader = ppo_trainer.accelerator.prepare(ds_test)
+    # Train the model
+    ppo_trainer.train()
 
-    # Setup text environment
-    prompt = """\
-Example of using a Python API to solve math questions.
-
-Q: Olivia has $23. She bought five bagels for $3 each. How much money does she have left?
-
-<request><PythonInterpreter>
-def solution():
-    money_initial = 23
-    bagels = 5
-    bagel_cost = 3
-    money_spent = bagels * bagel_cost
-    money_left = money_initial - money_spent
-    result = money_left
-    return result
-print(solution())
-<call>72<response>
-
-Result = 72 <submit>
-
-Q: """
-
-    generation_kwargs = {
-        "min_length": -1,
-        "top_k": 0.0,
-        "top_p": 1.0,
-        "do_sample": True,
-        "pad_token_id": tokenizer.eos_token_id,
-        "eos_token_id": -1,
-        "max_new_tokens": script_args.max_new_tokens,
-    }
-
-    text_env = TextEnvironment(
-        model=model,
-        tokenizer=tokenizer,
-        tools=[],  # No external tools needed
-        reward_fn=exact_match_reward,
-        prompt=prompt,
-        max_turns=2,
-        generation_kwargs=generation_kwargs,
-    )
-
-    # Training loop
-    for epoch in range(script_args.n_epochs):
-        for step, batch in enumerate(ppo_trainer.dataloader):
-            if (step == 0) and (epoch % 4 == 0):  # evaluate every 4 epochs
-                reward_mean_test = evaluate(
-                    test_dataloader,
-                    text_env,
-                    ppo_trainer,
-                )
-            else:
-                reward_mean_test = None
-
-            queries, responses, masks, rewards, histories = text_env.run(
-                batch["query"],
-                answers=batch["answer"],
-            )
-            train_stats = ppo_trainer.step(queries, responses, rewards, masks)
-
-            # Logging
-            if reward_mean_test is not None:
-                train_stats["env/reward_mean_test"] = reward_mean_test
-            texts = {
-                "query": batch["query"],
-                "response": [
-                    tokenizer.decode(response) for response in responses
-                ],
-                "answer": batch["answer"],
-            }
-            ppo_trainer.log_stats(
-                train_stats,
-                texts,
-                rewards,
-                columns_to_log=["query", "response", "answer"],
-            )
-
-    # Final evaluation
-    reward_mean_test = evaluate(test_dataloader, text_env, ppo_trainer)
+    # Save the model
     ppo_trainer.save_pretrained(f"model/{script_args.model_name}-gsm8k")
+
+
+def compute_rewards(responses, answers):
+    """Compute rewards for generated responses."""
+    rewards = []
+    for response, answer in zip(responses, answers):
+        reward = 0.0
+        try:
+            predicted_number = None
+            match_pattern = re.findall(r"Result\s*=\s*(-?\d+(?:\.\d+)?)\s*<submit>", response)
+            if match_pattern:
+                predicted_number = float(match_pattern[0])
+            if predicted_number is not None:
+                if np.abs(predicted_number - float(answer)) < 0.1:
+                    reward += 1.0
+        except Exception:
+            pass
+        rewards.append(torch.tensor(reward))
+    return rewards
+
+
+def evaluate(dataset, ppo_trainer):
+    """Evaluate model on dataset."""
+    rewards = []
+    for batch in ppo_trainer.get_eval_dataloader():
+        responses = ppo_trainer.generate(batch["query"])
+        batch_rewards = compute_rewards(responses, batch["answer"])
+        rewards.extend(batch_rewards)
+
+    if not rewards:
+        return torch.tensor(0.0)
+
+    rewards = ppo_trainer.accelerator.gather_for_metrics(
+        torch.stack(rewards).to(ppo_trainer.accelerator.device)
+    )
+    return rewards.mean()
 
 
 if __name__ == "__main__":
